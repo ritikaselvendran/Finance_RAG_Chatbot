@@ -186,8 +186,151 @@ def build_filter(
 
 
 # ---------------------------------------------------------------------------
-# Step 7 — Multi-year retrieval for trend queries
+# Step 6.5 — Query type detection and sub-query routing
 # ---------------------------------------------------------------------------
+
+# Keyword sets for each query type (lowercase for matching)
+_FINANCIAL_KEYWORDS = {
+    "revenue", "sales", "income", "profit", "loss", "earnings",
+    "cash", "operating", "ebitda", "margin", "expense", "cost",
+    "assets", "liabilities", "equity", "debt", "dividend", "eps",
+    "shares", "capital", "expenditure", "capex", "gross", "net",
+    "balance", "sheet", "cash flow", "free cash", "interest",
+}
+
+_GOVERNANCE_KEYWORDS = {
+    "board", "director", "directors", "executive", "officer",
+    "ceo", "cfo", "coo", "cto", "president", "chairman",
+    "management", "governance", "team", "leadership", "founded",
+    "members", "appointed", "compensation", "salary",
+}
+
+_RISK_KEYWORDS = {
+    "risk", "risks", "threat", "uncertainty", "factor",
+    "challenge", "concern", "exposure", "litigation", "lawsuit",
+    "regulatory", "compliance", "competition", "cybersecurity",
+}
+
+_STRATEGY_KEYWORDS = {
+    "strategy", "strategic", "growth", "plan", "outlook",
+    "segment", "product", "service", "market", "business",
+    "acquisition", "partnership", "innovation", "research",
+    "development", "expansion", "initiative", "priority",
+}
+
+_LEGAL_KEYWORDS = {
+    "legal", "lawsuit", "litigation", "settlement", "claim",
+    "proceeding", "court", "regulatory", "investigation",
+    "penalty", "fine", "compliance", "contingency",
+}
+
+
+def detect_query_type(query: str) -> str:
+    """
+    Detect the type of financial report question being asked.
+
+    Scans the query for domain-specific keywords and returns one of:
+        "financial"   — numbers, metrics, statements (default)
+        "governance"  — board members, executives, leadership
+        "risk"        — risk factors, threats, challenges
+        "strategy"    — business strategy, growth, segments
+        "legal"       — litigation, legal proceedings, compliance
+
+    Used to select appropriate sub-queries for retrieval. Financial
+    sub-queries steer toward income statements and balance sheets, while
+    governance sub-queries steer toward Part III sections.
+
+    Args:
+        query: User's plain-text question (case-insensitive).
+
+    Returns:
+        Query type string.
+    """
+    q_lower = query.lower()
+    words   = set(q_lower.split())
+
+    # Score each category by keyword overlap
+    scores = {
+        "governance" : len(words & _GOVERNANCE_KEYWORDS),
+        "risk"       : len(words & _RISK_KEYWORDS),
+        "strategy"   : len(words & _STRATEGY_KEYWORDS),
+        "legal"      : len(words & _LEGAL_KEYWORDS),
+        "financial"  : len(words & _FINANCIAL_KEYWORDS),
+    }
+
+    # Also check multi-word phrases
+    if any(p in q_lower for p in ["board of directors", "executive team",
+                                   "executive officer", "chief executive",
+                                   "board member"]):
+        scores["governance"] += 3
+    if any(p in q_lower for p in ["risk factor", "risk factors",
+                                   "key risk", "major risk"]):
+        scores["risk"] += 3
+    if any(p in q_lower for p in ["cash flow", "net income", "net sales",
+                                   "total revenue", "operating income",
+                                   "gross profit", "earnings per share"]):
+        scores["financial"] += 3
+
+    # Return the highest scoring type, default to "financial"
+    best = max(scores, key=lambda k: scores[k])
+    return best if scores[best] > 0 else "financial"
+
+
+def get_sub_queries(query: str, query_type: str) -> list[str]:
+    """
+    Return a list of sub-queries appropriate for the detected query type.
+
+    The first entry is always the original query (highest semantic fidelity).
+    The remaining entries are targeted phrasings that match the section
+    headings used in 10-K filings for that topic area.
+
+    Args:
+        query:      Original user query.
+        query_type: One of "financial", "governance", "risk",
+                    "strategy", "legal".
+
+    Returns:
+        List of query strings to embed and search with.
+    """
+    sub_query_map = {
+        "financial": [
+            query,
+            "cash flow from operating activities consolidated statements of cash flows",
+            "net income revenue net sales consolidated statements of operations income",
+            "total assets liabilities stockholders equity consolidated balance sheet",
+            "earnings per share diluted annual selected financial data quarterly",
+        ],
+        "governance": [
+            query,
+            "directors executive officers corporate governance board of directors names",
+            "executive team leadership CEO CFO COO president chairman members",
+            "information about our executive officers directors compensation",
+            "part III item 10 directors executive officers corporate governance",
+        ],
+        "risk": [
+            query,
+            "risk factors item 1A business risks uncertainties challenges",
+            "risk factors that could affect our business results operations",
+            "key risks regulatory competition cybersecurity market risk",
+            "forward looking statements risks uncertainties factors",
+        ],
+        "strategy": [
+            query,
+            "business overview strategy products services markets segments",
+            "growth strategy initiatives priorities investments acquisitions",
+            "management discussion analysis overview business highlights",
+            "item 1 business description products services competition",
+        ],
+        "legal": [
+            query,
+            "legal proceedings litigation settlements commitments contingencies",
+            "item 3 legal proceedings lawsuits regulatory investigations",
+            "commitments contingencies legal claims pending proceedings",
+            "note commitments contingencies legal matters",
+        ],
+    }
+
+    return sub_query_map.get(query_type, sub_query_map["financial"])
 
 def retrieve_across_years(
     collection: chromadb.Collection,
@@ -223,18 +366,8 @@ def retrieve_across_years(
     """
     all_results  = []
     seen_ids     = set()
-
-    # Sub-queries targeting different section names that contain net income.
-    # Financial statements use varied headings across companies:
-    # "Consolidated Statements of Income", "Consolidated Statements of
-    # Operations", "Selected Financial Data", "Quarterly Data".
-    # Multiple sub-queries improve recall across all these variations.
-    sub_queries = [
-        query,
-        "net income consolidated statements of income operations earnings",
-        "net income attributable total annual earnings per share diluted",
-        "income tax provision net earnings consolidated financial statements",
-    ]
+    query_type   = detect_query_type(query)
+    sub_queries  = get_sub_queries(query, query_type)
 
     for year in years:
         where         = build_filter(company=company, year=year)
@@ -294,27 +427,106 @@ class FinanceRetriever:
         year: str | None = None,
     ) -> list[tuple[Document, float]]:
         """
-        Embed the query and return top_k (Document, score) pairs.
+        Embed the query using type-aware sub-queries and return top_k results.
 
-        Optionally filter by company and/or year using ChromaDB metadata
-        filters. If neither is provided, searches across all documents.
+        Detects the query type (financial, governance, risk, strategy, legal)
+        and selects sub-queries that match the section headings used in 10-K
+        filings for that topic. This ensures the retriever fetches from the
+        right part of the document regardless of what is being asked.
 
         Args:
             query:   User's plain-text question.
-            company: Optional company name filter e.g. "AMAZON".
-            year:    Optional year filter e.g. "2022".
+            company: Optional company name filter.
+            year:    Optional year filter.
 
         Returns:
             List of (Document, similarity_score) tuples, best match first.
         """
-        query_vec   = embed_query(query, self.model)
-        where       = build_filter(company=company, year=year)
-        raw_results = query_collection(
-            self.collection, query_vec,
-            top_k=self.top_k,
-            where=where,
-        )
-        return results_to_documents(raw_results)
+        where      = build_filter(company=company, year=year)
+        seen_ids   = set()
+        results    = []
+        query_type = detect_query_type(query)
+        sub_queries = get_sub_queries(query, query_type)
+
+        print(f"  Query type detected: {query_type}")
+
+        for sub_q in sub_queries:
+            query_vec = embed_query(sub_q, self.model)
+            try:
+                raw  = query_collection(
+                    self.collection, query_vec,
+                    top_k=self.top_k,
+                    where=where,
+                )
+                docs = results_to_documents(raw)
+                for doc, score in docs:
+                    cid = doc.metadata.get("chunk_id", "")
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        results.append((doc, score))
+            except Exception:
+                continue
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:self.top_k]
+
+    def get_comparison_documents(
+        self,
+        query: str,
+        companies: list[str],
+        year: str | None = None,
+        chunks_per_company: int = 3,
+    ) -> list[tuple[Document, float]]:
+        """
+        Retrieve chunks for each company separately and combine.
+
+        For comparison questions like "Compare Apple and Microsoft revenue
+        in 2022", this fetches chunks_per_company chunks from each company
+        independently using metadata filters, then combines them.
+
+        Each company gets equal representation in the context so the LLM
+        has data for both sides of the comparison.
+
+        Args:
+            query:              User's question.
+            companies:          List of company names e.g. ["APPLE", "MICROSOFT"].
+            year:               Optional year to filter all companies by.
+            chunks_per_company: Chunks to fetch per company (default 3).
+
+        Returns:
+            Combined list of (Document, score) grouped by company.
+        """
+        all_results = []
+        seen_ids    = set()
+        query_type  = detect_query_type(query)
+        sub_queries = get_sub_queries(query, query_type)
+
+        for company in companies:
+            where        = build_filter(company=company, year=year)
+            comp_results = []
+
+            for sub_q in sub_queries:
+                query_vec = embed_query(sub_q, self.model)
+                try:
+                    raw  = query_collection(
+                        self.collection, query_vec,
+                        top_k=chunks_per_company,
+                        where=where,
+                    )
+                    docs = results_to_documents(raw)
+                    for doc, score in docs:
+                        cid = doc.metadata.get("chunk_id", "")
+                        if cid not in seen_ids:
+                            seen_ids.add(cid)
+                            comp_results.append((doc, score))
+                except Exception:
+                    continue
+
+            # Keep top chunks_per_company for this company
+            comp_results.sort(key=lambda x: x[1], reverse=True)
+            all_results.extend(comp_results[:chunks_per_company])
+
+        return all_results
 
     def get_trend_documents(
         self,
