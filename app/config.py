@@ -29,7 +29,7 @@ ENV_PATH = PROJECT_ROOT / ".env"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Groq LLM — fast LPU-based inference
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "qwen/qwen3.8-27b"
 
 # -------------------------------------------------------------------
 # Retrieval settings
